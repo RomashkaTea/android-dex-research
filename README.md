@@ -180,6 +180,7 @@ struct SparseSwitchData012 {
 python3 tools/dex012.py -H app/Calculator.apk
 python3 tools/dex012.py -d --class-filter 'Calculator;' app/Calculator.apk
 python3 tools/dex012.py --smali-out out/smali app/Calculator.apk
+python3 tools/smali012.py out/smali -o out/classes.dex
 python3 tools/dex012.py --validate --json framework/core.jar
 python3 -m unittest tools/test_dex012.py
 DEX012_CORPUS=/path/to/android/system python3 -m unittest tools/test_dex012.py
@@ -191,6 +192,33 @@ lengths, catch handlers, switch payload types, and all branch boundaries. The
 small synthetic tests run everywhere; setting `DEX012_CORPUS` enables the
 full-system regression suite without checking proprietary binaries into this
 repository.
+
+## Smali-to-DEX 012 assembly
+
+`tools/smali012.py` assembles a Smali file or directory into a raw DEX 012
+file. It builds all identifier and class tables, separates direct and virtual
+methods, lays out code and exception data, resolves labels and switch payloads,
+and writes the DEX SHA-1 signature and Adler-32 checksum. The generated file is
+parsed and fully validated before it is written:
+
+```sh
+python3 tools/dex012.py app/Calculator.apk --smali-out out/smali
+python3 tools/smali012.py out/smali -o out/classes.dex
+python3 tools/dex012.py out/classes.dex --validate
+```
+
+Existing output files are protected unless `--force` is supplied.
+`--no-validate` is available for investigating malformed output.
+
+The assembler accepts the complete instruction and metadata subset emitted by
+the companion disassembler, including DEX 012 packed/sparse switches, absolute
+exception ranges, primitive array opcodes, special constants, and optimized
+quick/inline instructions. Debug streams and general annotation values are
+currently omitted because the disassembler preserves them only as comments.
+
+Round-trip testing covers all 41 APK/JAR files in the Sooner system image:
+8,392 classes, 53,910 code items, and 1,180,222 decoded instructions and
+payloads.
 
 ## DEX-to-Smali export
 
