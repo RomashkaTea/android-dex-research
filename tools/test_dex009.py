@@ -19,8 +19,8 @@ from dex009 import (  # noqa: E402
     PHYSICAL_TO_LOGICAL_009,
     Dex009,
 )
-from dex012 import Dex012  # noqa: E402
-from smali012 import Dex012Assembler, SmaliParser  # noqa: E402
+from smali009 import Dex009Assembler  # noqa: E402
+from smali012 import SmaliParser  # noqa: E402
 
 
 CORPUS_ENV = os.environ.get("DEX009_CORPUS")
@@ -59,6 +59,77 @@ class Dex009Tests(unittest.TestCase):
         self.assertIsNone(PHYSICAL_TO_LOGICAL_009[0xF1])
         self.assertEqual(PHYSICAL_TO_LOGICAL_009[0xF2], 0xF2)
         self.assertEqual(PHYSICAL_TO_LOGICAL_009[0xFB], 0xFB)
+
+    def test_smali_assembler_synthetic(self) -> None:
+        source = """\
+.class public Lexample/Assembler009;
+.super Ljava/lang/Object;
+.source "Assembler009.java"
+
+.field public static message:Ljava/lang/String; = "hello"
+
+.method public constructor <init>()V
+    .registers 1
+    invoke-direct {v0}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
+
+.method public static optimized()V
+    .registers 1
+    execute-inline {v0}, inline@0x1
+    return-void
+.end method
+
+.method public abstract risky()V
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljava/io/IOException;
+        }
+    .end annotation
+.end method
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Assembler009.smali"
+            path.write_text(source, encoding="utf-8")
+            data = Dex009Assembler(SmaliParser().parse_path(path)).assemble()
+
+        dex = Dex009(data, "synthetic-assembled-009.dex")
+        result = dex.validate()
+        self.assertEqual(dex.header.magic, DEX_MAGIC)
+        self.assertEqual(dex.checksum_status(), (True, True))
+        self.assertEqual(result["classes"], 1)
+        self.assertEqual(result["methods"], 3)
+        self.assertEqual(result["opcode_counts"]["+execute-inline"], 1)
+
+        class_def = dex.class_def(0)
+        methods = [
+            method
+            for off in (
+                class_def.direct_methods_off, class_def.virtual_methods_off
+            )
+            for method in dex.methods(off)
+        ]
+        risky = next(
+            method for method in methods
+            if ".risky:" in dex.method_label(method.method_idx)
+        )
+        self.assertEqual(
+            [
+                dex.type_descriptor(index)
+                for index in dex.type_list(risky.thrown_exceptions_off)
+            ],
+            ["Ljava/io/IOException;"],
+        )
+        optimized = next(
+            method for method in methods
+            if ".optimized:" in dex.method_label(method.method_idx)
+        )
+        execute = next(
+            insn
+            for insn in dex.instructions(dex.code(optimized.code_off))
+            if insn.name == "+execute-inline"
+        )
+        self.assertEqual(execute.raw[0] & 0xFF, 0xEE)
 
     @unittest.skipUnless(HAS_CORPUS, "set DEX009_CORPUS to htc-29386.0.9.0.0")
     def test_calculator_integrity_and_debug_tables(self) -> None:
@@ -114,9 +185,9 @@ class Dex009Tests(unittest.TestCase):
             self.assertIn(".packed-switch", text)
             self.assertIn(".sparse-switch", text)
 
-            rebuilt = Dex012(
-                Dex012Assembler(SmaliParser().parse_path(output)).assemble(),
-                "DEX009-Smali-logical-roundtrip.dex",
+            rebuilt = Dex009(
+                Dex009Assembler(SmaliParser().parse_path(output)).assemble(),
+                "DEX009-Smali-roundtrip.dex",
             )
         rebuilt_result = rebuilt.validate()
         original_result = original.validate()

@@ -11,7 +11,8 @@ pre-release Dalvik executable formats:
   [`tools/DEX009.md`](tools/DEX009.md).
 - `tools/dex012.py` parses, validates, disassembles, and exports Smali from
   the later Sooner build's `dex\n012\0` files.
-- `tools/smali012.py` assembles the supported Smali subset into DEX 012.
+- `tools/smali007.py`, `tools/smali009.py`, and `tools/smali012.py` assemble
+  the supported Smali subset directly into their respective native formats.
 
 The DEX 007 implementation has been validated against all 51 DEX-bearing
 APK/JAR files in build 20645: 4,905 classes, 31,167 code items, and 960,047

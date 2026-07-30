@@ -19,8 +19,8 @@ from dex007 import (  # noqa: E402
     PHYSICAL_TO_LOGICAL,
     Dex007,
 )
-from dex012 import Dex012  # noqa: E402
-from smali012 import Dex012Assembler, SmaliParser  # noqa: E402
+from smali007 import Dex007Assembler  # noqa: E402
+from smali012 import SmaliError, SmaliParser  # noqa: E402
 
 
 CORPUS_ENV = os.environ.get("DEX007_CORPUS")
@@ -66,6 +66,90 @@ class Dex007Tests(unittest.TestCase):
         self.assertEqual(PHYSICAL_TO_LOGICAL[0xFB], 0xFB)
         self.assertIsNone(PHYSICAL_TO_LOGICAL[0xFC])
 
+    def test_smali_assembler_synthetic(self) -> None:
+        source = """\
+.class public Lexample/Assembler007;
+.super Ljava/lang/Object;
+.source "Assembler007.java"
+
+.field public static message:Ljava/lang/String; = "hello"
+.field private value:I
+
+.method public constructor <init>()V
+    .registers 1
+    invoke-direct {v0}, Ljava/lang/Object;-><init>()V
+    return-void
+.end method
+
+.method public static choose(I)I
+    .registers 2
+    .catch Ljava/lang/Exception; {:try_start .. :try_end} :handler
+    :try_start
+    packed-switch p0, :switch_data
+    const/4 v0, -0x1
+    :try_end
+    return v0
+    :case_one
+    const/4 v0, 0x1
+    return v0
+    :handler
+    move-exception v0
+    const/4 v0, 0x0
+    return v0
+    :switch_data
+    .packed-switch 0x1
+        :case_one
+    .end packed-switch
+.end method
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Assembler007.smali"
+            path.write_text(source, encoding="utf-8")
+            data = Dex007Assembler(SmaliParser().parse_path(path)).assemble()
+
+        dex = Dex007(data, "synthetic-assembled-007.dex")
+        result = dex.validate()
+        self.assertEqual(dex.header.magic, DEX_MAGIC)
+        self.assertEqual(dex.checksum_status(), (True, True))
+        self.assertEqual(result["classes"], 1)
+        self.assertEqual(result["methods"], 2)
+        self.assertEqual(result["payloads"], 1)
+        self.assertEqual(dex.type_descriptor(0), "L__dex__/NoSuperclass;")
+        constructor = next(dex.methods(dex.class_def(0).direct_methods_off))
+        invoke = next(
+            insn
+            for insn in dex.instructions(dex.code(constructor.code_off))
+            if insn.name == "invoke-direct"
+        )
+        self.assertEqual(invoke.raw[0] & 0xFF, 0x6F)
+
+        unsupported = source.replace(
+            "    return-void",
+            "    execute-inline {v0}, inline@0x1\n    return-void",
+            1,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Unsupported007.smali"
+            path.write_text(unsupported, encoding="utf-8")
+            with self.assertRaises(SmaliError):
+                Dex007Assembler(SmaliParser().parse_path(path)).assemble()
+
+        throws_source = source + """\
+
+.method public abstract risky()V
+    .annotation system Ldalvik/annotation/Throws;
+        value = {
+            Ljava/io/IOException;
+        }
+    .end annotation
+.end method
+"""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "Throws007.smali"
+            path.write_text(throws_source, encoding="utf-8")
+            with self.assertRaises(SmaliError):
+                Dex007Assembler(SmaliParser().parse_path(path)).assemble()
+
     @unittest.skipUnless(HAS_CORPUS, "set DEX007_CORPUS to build 20645")
     def test_calculator_integrity_and_debug_tables(self) -> None:
         dex = Dex007.from_path(CORPUS_ROOT / "app" / "Calculator.apk")
@@ -97,9 +181,9 @@ class Dex007Tests(unittest.TestCase):
             self.assertIn(".packed-switch", text)
             self.assertIn(".sparse-switch", text)
 
-            rebuilt = Dex012(
-                Dex012Assembler(SmaliParser().parse_path(output)).assemble(),
-                "DEX007-Smali-logical-roundtrip.dex",
+            rebuilt = Dex007(
+                Dex007Assembler(SmaliParser().parse_path(output)).assemble(),
+                "DEX007-Smali-roundtrip.dex",
             )
         rebuilt_result = rebuilt.validate()
         original_result = original.validate()
