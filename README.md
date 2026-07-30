@@ -179,6 +179,7 @@ struct SparseSwitchData012 {
 ```sh
 python3 tools/dex012.py -H app/Calculator.apk
 python3 tools/dex012.py -d --class-filter 'Calculator;' app/Calculator.apk
+python3 tools/dex012.py --smali-out out/smali app/Calculator.apk
 python3 tools/dex012.py --validate --json framework/core.jar
 python3 -m unittest tools/test_dex012.py
 DEX012_CORPUS=/path/to/android/system python3 -m unittest tools/test_dex012.py
@@ -190,3 +191,20 @@ lengths, catch handlers, switch payload types, and all branch boundaries. The
 small synthetic tests run everywhere; setting `DEX012_CORPUS` enables the
 full-system regression suite without checking proprietary binaries into this
 repository.
+
+## DEX-to-Smali export
+
+`--smali-out DIR` writes one source file per class using the descriptor as its
+directory path. Existing files are protected by default; pass `--force` to
+replace them. `--class-filter TEXT` can limit the export.
+
+The exporter emits class, superclass, interface, source, field, method,
+register, exception, branch, packed-switch, and sparse-switch directives. It
+also converts DEX 012's primitive-specific `new-array-*` instructions and
+`const/special` tables into ordinary Smali instructions. Unoptimized
+Calculator output has been assembled successfully with Smali 3.0.9.
+
+DEX 012 annotations and debug streams are not decoded yet, so their offsets are
+preserved as comments. Optimized quick/inline opcodes are emitted in odex-style
+Smali form and may require an assembler mode that permits optimized
+instructions.

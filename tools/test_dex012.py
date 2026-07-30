@@ -2,8 +2,10 @@
 
 import hashlib
 import os
+import re
 import struct
 import sys
+import tempfile
 import unittest
 import zlib
 from pathlib import Path
@@ -55,6 +57,41 @@ class Dex012Tests(unittest.TestCase):
         self.assertEqual(result["payloads"], 19)
         self.assertGreater(result["branch_targets"], 0)
         self.assertEqual(result["string_length_mismatches"], 0)
+
+    @unittest.skipUnless(HAS_CORPUS, "set DEX012_CORPUS to the Android system root")
+    def test_smali_export(self) -> None:
+        dex = Dex012.from_path(CORPUS_ROOT / "app" / "Calculator.apk")
+        with tempfile.TemporaryDirectory() as output:
+            paths = dex.write_smali(output, class_filter="/Calculator;")
+            self.assertEqual(len(paths), 1)
+            text = paths[0].read_text(encoding="utf-8")
+
+            self.assertIn(
+                ".class Lcom/google/android/calculator/Calculator;", text
+            )
+            self.assertIn(".super Landroid/app/Activity;", text)
+            self.assertIn(".method public constructor <init>()V", text)
+            self.assertIn(
+                "invoke-direct {v1}, Landroid/app/Activity;-><init>()V", text
+            )
+            self.assertIn(".packed-switch", text)
+            self.assertIn(".sparse-switch", text)
+            self.assertIn(".catch Ljava/lang/Exception;", text)
+            self.assertIn("# DEX012 const-wide/special =", text)
+            self.assertNotRegex(text, r"(?m)^\\s*const-wide/special\\b")
+
+            references = set(re.findall(r":L[0-9a-f]{4,}\\b", text))
+            definitions = set(
+                re.findall(r"^\\s*(:L[0-9a-f]{4,})$", text, re.MULTILINE)
+            )
+            self.assertFalse(references - definitions)
+
+            with self.assertRaises(FileExistsError):
+                dex.write_smali(output, class_filter="/Calculator;")
+            self.assertEqual(
+                len(dex.write_smali(output, class_filter="/Calculator;", force=True)),
+                1,
+            )
 
     @unittest.skipUnless(HAS_CORPUS, "set DEX012_CORPUS to the Android system root")
     def test_no_superclass_sentinel(self) -> None:

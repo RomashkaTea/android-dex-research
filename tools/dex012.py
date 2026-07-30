@@ -7,6 +7,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import math
 import struct
 import sys
 import zipfile
@@ -343,6 +344,79 @@ FORMAT_WIDTHS = {
     18: 3, 19: 3, 20: 3, 21: -3, 23: 3, 24: -3,
     26: -3, 27: 5,
 }
+
+SPECIAL_FLOAT_BITS = (
+    0xC0000000, 0xBF800000, 0xBF000000, 0xBE800000,
+    0xBDCCCCCD, 0x3DCCCCCD, 0x3E800000, 0x3F000000,
+    0x3F800000, 0x40000000, 0x40400000, 0x40800000,
+    0x40A00000, 0x41200000, 0x42C80000, 0x447A0000,
+)
+
+SPECIAL_DOUBLE_BITS = (
+    0xC000000000000000, 0xBFF0000000000000,
+    0xBFE0000000000000, 0xBFD0000000000000,
+    0xBFB999999999999A, 0x3FB999999999999A,
+    0x3FD0000000000000, 0x3FE0000000000000,
+    0x3FF0000000000000, 0x4000000000000000,
+    0x4008000000000000, 0x4010000000000000,
+    0x4014000000000000, 0x4024000000000000,
+    0x4059000000000000, 0x408F400000000000,
+)
+
+ACCESS_FLAGS = {
+    "class": (
+        (0x0001, "public"),
+        (0x0010, "final"),
+        (0x0200, "interface"),
+        (0x0400, "abstract"),
+        (0x1000, "synthetic"),
+        (0x2000, "annotation"),
+        (0x4000, "enum"),
+    ),
+    "field": (
+        (0x0001, "public"),
+        (0x0002, "private"),
+        (0x0004, "protected"),
+        (0x0008, "static"),
+        (0x0010, "final"),
+        (0x0040, "volatile"),
+        (0x0080, "transient"),
+        (0x1000, "synthetic"),
+        (0x4000, "enum"),
+    ),
+    "method": (
+        (0x0001, "public"),
+        (0x0002, "private"),
+        (0x0004, "protected"),
+        (0x0008, "static"),
+        (0x0010, "final"),
+        (0x0020, "synchronized"),
+        (0x0040, "bridge"),
+        (0x0080, "varargs"),
+        (0x0100, "native"),
+        (0x0400, "abstract"),
+        (0x0800, "strictfp"),
+        (0x1000, "synthetic"),
+        (0x10000, "constructor"),
+        (0x20000, "declared-synchronized"),
+    ),
+}
+
+
+def _access_words(flags: int, kind: str) -> tuple[list[str], int]:
+    words: list[str] = []
+    remaining = flags
+    for bit, word in ACCESS_FLAGS[kind]:
+        if flags & bit:
+            words.append(word)
+            remaining &= ~bit
+    return words, remaining
+
+
+def _hex_literal(value: int, suffix: str = "") -> str:
+    if value < 0:
+        return f"-0x{-value:x}{suffix}"
+    return f"0x{value:x}{suffix}"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -840,6 +914,403 @@ class Dex012:
             return f"v{a}, v{b}, [obj+0x{c:04x}]"
         return ", ".join(f"{key}={value}" for key, value in d.items())
 
+    def smali_field_ref(self, idx: int) -> str:
+        field = self.field_id(idx)
+        return (
+            f"{self.type_descriptor(field.class_idx)}->"
+            f"{self.string(field.name_idx)}:{self.string(field.type_descriptor_idx)}"
+        )
+
+    def smali_method_ref(self, idx: int) -> str:
+        method = self.method_id(idx)
+        return (
+            f"{self.type_descriptor(method.class_idx)}->"
+            f"{self.string(method.name_idx)}{self.string(method.descriptor_idx)}"
+        )
+
+    @staticmethod
+    def _smali_float(bits: int, double: bool = False) -> str:
+        if double:
+            value = struct.unpack("<d", struct.pack("<Q", bits & 0xFFFFFFFFFFFFFFFF))[0]
+            suffix = ""
+        else:
+            value = struct.unpack("<f", struct.pack("<I", bits & 0xFFFFFFFF))[0]
+            suffix = "f"
+        if math.isnan(value):
+            return f"NaN{suffix}"
+        if math.isinf(value):
+            return f"{'-' if value < 0 else ''}Infinity{suffix}"
+        return f"{repr(value)}{suffix}"
+
+    def _smali_static_value(self, descriptor: str, value: int) -> str | None:
+        if descriptor == "Ljava/lang/String;":
+            if value == 0xFFFFFFFFFFFFFFFF:
+                return None
+            return json.dumps(self.string(value))
+        if descriptor.startswith(("L", "[")):
+            return None
+        if descriptor == "Z":
+            return "true" if value else "false"
+        if descriptor == "B":
+            return _hex_literal(_signed(value & 0xFF, 8))
+        if descriptor == "S":
+            return _hex_literal(_signed(value & 0xFFFF, 16))
+        if descriptor == "C":
+            return _hex_literal(value & 0xFFFF)
+        if descriptor == "I":
+            return _hex_literal(_signed(value & 0xFFFFFFFF, 32))
+        if descriptor == "J":
+            return _hex_literal(_signed(value, 64), "L")
+        if descriptor == "F":
+            return self._smali_float(value)
+        if descriptor == "D":
+            return self._smali_float(value, double=True)
+        return _hex_literal(value)
+
+    @staticmethod
+    def _smali_label(pc: int) -> str:
+        return f":L{pc:04x}"
+
+    def _smali_instruction(self, insn: Instruction) -> str:
+        if insn.opcode is None:
+            raise DexError("payload must be rendered with its referring switch")
+        opcode = insn.opcode
+        name = OP_NAMES[opcode].lstrip("+")
+        d = self._decode_operands(FORMATS[opcode], insn.raw)
+        a = int(d.get("A", 0))
+        b = int(d.get("B", 0))
+        c = int(d.get("C", 0))
+        label = self._smali_label
+
+        if opcode in (0x00, 0x0E):
+            return name
+        if opcode in range(0x23, 0x2B):
+            primitive = ("Z", "B", "C", "S", "I", "J", "F", "D")[opcode - 0x23]
+            return f"new-array v{a}, v{b}, [{primitive}"
+        if opcode in _ranges(range(0x01, 0x0A), 0x20,
+                             range(0x7B, 0x90), range(0xB0, 0xD0)):
+            return f"{name} v{a}, v{b}"
+        if opcode in _ranges(
+            range(0x0A, 0x0E), range(0x0F, 0x12), 0x1C, 0x1D, 0x33
+        ):
+            return f"{name} v{a}"
+        if opcode in (0x12, 0x13, 0x14):
+            return f"{name} v{a}, {_hex_literal(b)}"
+        if opcode in (0x15, 0x16):
+            return f"{name} v{a}, {_hex_literal(b, 'L')}"
+        if opcode == 0x17:
+            return f"{name} v{a}, {_hex_literal(_signed(b, 64), 'L')}"
+        if opcode == 0x18:
+            return f'{name} v{a}, {json.dumps(self.string(b))}'
+        if opcode == 0x19:
+            return f"{name} v{a}, {self.type_descriptor(b)}"
+        if opcode == 0x1A:
+            bits = SPECIAL_FLOAT_BITS[b]
+            return (
+                f"const v{a}, 0x{bits:08x} "
+                f"# DEX012 const/special = {self._smali_float(bits)}"
+            )
+        if opcode == 0x1B:
+            bits = SPECIAL_DOUBLE_BITS[b]
+            return (
+                f"const-wide v{a}, 0x{bits:016x}L "
+                f"# DEX012 const-wide/special = {self._smali_float(bits, True)}"
+            )
+        if opcode == 0x1E:
+            return f"{name} v{a}, {self.type_descriptor(b)}"
+        if opcode == 0x1F:
+            return f"{name} v{a}, v{b}, {self.type_descriptor(c)}"
+        if opcode == 0x21:
+            return f"{name} v{a}, {self.type_descriptor(b)}"
+        if opcode == 0x22:
+            return f"{name} v{a}, v{b}, {self.type_descriptor(c)}"
+        if (
+            opcode in range(0x2E, 0x33)
+            or opcode in range(0x44, 0x52)
+            or opcode in range(0x90, 0xB0)
+        ):
+            return f"{name} v{a}, v{b}, v{c}"
+        if opcode == 0x34:
+            return f"goto {label(insn.pc + a)}"
+        if opcode == 0x35:
+            return f"goto/32 {label(insn.pc + a)} # DEX012 goto/24"
+        if opcode in (0x36, 0x37):
+            return f"{name} v{a}, {label(insn.pc + b)}"
+        if opcode in range(0x38, 0x3E):
+            return f"{name} v{a}, v{b}, {label(insn.pc + c)}"
+        if opcode in range(0x3E, 0x44):
+            return f"{name} v{a}, {label(insn.pc + b)}"
+        if opcode in range(0x52, 0x60):
+            return f"{name} v{a}, v{b}, {self.smali_field_ref(c)}"
+        if opcode in range(0x60, 0x6E):
+            return f"{name} v{a}, {self.smali_field_ref(b)}"
+        if opcode in range(0xD0, 0xE3):
+            return f"{name} v{a}, v{b}, {_hex_literal(c)}"
+        if opcode in _ranges(0x2B, range(0x6E, 0x73), 0xF0, 0xEE, 0xF8, 0xFA):
+            args = ", ".join(f"v{x}" for x in d.get("args", []))
+            if opcode == 0xEE:
+                ref = f"inline@0x{b:x}"
+            elif opcode in (0xF8, 0xFA):
+                ref = f"vtable@0x{b:x}"
+            else:
+                ref = (
+                    self.type_descriptor(b)
+                    if opcode == 0x2B else self.smali_method_ref(b)
+                )
+            return f"{name} {{{args}}}, {ref}"
+        if opcode in _ranges(0x2C, range(0x74, 0x79), 0xF9, 0xFB):
+            end = c + a - 1
+            regs = "{}" if a == 0 else f"{{v{c} .. v{end}}}"
+            if opcode == 0x2C:
+                ref = self.type_descriptor(b)
+            elif opcode in (0xF9, 0xFB):
+                ref = f"vtable@0x{b:x}"
+            else:
+                ref = self.smali_method_ref(b)
+            return f"{name} {regs}, {ref}"
+        if opcode in range(0xF2, 0xF8):
+            return f"{name} v{a}, v{b}, field@0x{c:x}"
+        operands = ", ".join(f"{key}={value}" for key, value in d.items())
+        return f"{name} {operands}".rstrip()
+
+    def _smali_method(self, method: DexMethod, class_source_idx: int | None) -> list[str]:
+        method_id = self.method_id(method.method_idx)
+        name = self.string(method_id.name_idx)
+        descriptor = self.string(method_id.descriptor_idx)
+        access, unknown_access = _access_words(method.access_flags, "method")
+        if name in ("<init>", "<clinit>") and "constructor" not in access:
+            access.append("constructor")
+        declaration = " ".join(access + [f"{name}{descriptor}"])
+        lines: list[str] = []
+        if unknown_access:
+            lines.append(f"# unknown method access flags: 0x{unknown_access:x}")
+        lines.append(f".method {declaration}")
+
+        throws = self.type_list(method.thrown_exceptions_off)
+        code = self.code(method.code_off)
+        if code is not None:
+            lines.append(f"    .registers {code.registers_size}")
+            if code.source_file_idx != NO_INDEX and code.source_file_idx != class_source_idx:
+                lines.append(
+                    f"    # source {json.dumps(self.string(code.source_file_idx))}"
+                )
+            if code.debug_info_off:
+                lines.append(
+                    f"    # DEX012 debug info at file offset 0x{code.debug_info_off:x}"
+                )
+        if throws:
+            lines.extend([
+                "    .annotation system Ldalvik/annotation/Throws;",
+                "        value = {",
+            ])
+            lines.extend(
+                f"            {self.type_descriptor(type_idx)}"
+                + ("," if i + 1 < len(throws) else "")
+                for i, type_idx in enumerate(throws)
+            )
+            lines.extend([
+                "        }",
+                "    .end annotation",
+            ])
+
+        if code is None:
+            lines.append(".end method")
+            return lines
+
+        instructions = list(self.instructions(code))
+        by_pc = {insn.pc: insn for insn in instructions}
+        labels: set[int] = set()
+        switch_by_payload: dict[int, Instruction] = {}
+
+        for insn in instructions:
+            if insn.opcode is None:
+                continue
+            decoded = self._decode_operands(FORMATS[insn.opcode], insn.raw)
+            if insn.opcode in (0x34, 0x35):
+                labels.add(insn.pc + int(decoded["A"]))
+            elif insn.opcode in range(0x38, 0x3E):
+                labels.add(insn.pc + int(decoded["C"]))
+            elif insn.opcode in range(0x3E, 0x44):
+                labels.add(insn.pc + int(decoded["B"]))
+            elif insn.opcode in (0x36, 0x37):
+                payload_pc = insn.pc + int(decoded["B"])
+                labels.add(payload_pc)
+                switch_by_payload[payload_pc] = insn
+                payload = by_pc[payload_pc]
+                size = payload.raw[1]
+                target_start = 4 if insn.opcode == 0x36 else 2 + size * 2
+                labels.update(
+                    insn.pc + _signed(value, 16)
+                    for value in payload.raw[target_start:target_start + size]
+                )
+
+        catches = list(self.catches(code.exceptions_off))
+        for start, end, handler, _type_idx in catches:
+            labels.update((start, end, handler))
+        for start, end, handler, type_idx in catches:
+            if type_idx == CATCH_ALL:
+                lines.append(
+                    f"    .catchall "
+                    f"{{{self._smali_label(start)} .. {self._smali_label(end)}}} "
+                    f"{self._smali_label(handler)}"
+                )
+            else:
+                lines.append(
+                    f"    .catch {self.type_descriptor(type_idx)} "
+                    f"{{{self._smali_label(start)} .. {self._smali_label(end)}}} "
+                    f"{self._smali_label(handler)}"
+                )
+
+        for insn in instructions:
+            if insn.pc in labels:
+                lines.append(f"    {self._smali_label(insn.pc)}")
+            if insn.opcode is not None:
+                lines.append(f"    {self._smali_instruction(insn)}")
+                continue
+
+            switch = switch_by_payload.get(insn.pc)
+            if switch is None:
+                raw = " ".join(f"{word:04x}" for word in insn.raw)
+                lines.append(f"    # unreferenced DEX012 payload: {raw}")
+                continue
+            size = insn.raw[1]
+            if switch.opcode == 0x36:
+                first_key = _signed(insn.raw[2] | (insn.raw[3] << 16), 32)
+                lines.append(f"    .packed-switch {_hex_literal(first_key)}")
+                for value in insn.raw[4:4 + size]:
+                    lines.append(
+                        f"        {self._smali_label(switch.pc + _signed(value, 16))}"
+                    )
+                lines.append("    .end packed-switch")
+            else:
+                lines.append("    .sparse-switch")
+                target_start = 2 + size * 2
+                for i in range(size):
+                    key = _signed(
+                        insn.raw[2 + i * 2] | (insn.raw[3 + i * 2] << 16), 32
+                    )
+                    target = switch.pc + _signed(insn.raw[target_start + i], 16)
+                    lines.append(
+                        f"        {_hex_literal(key)} -> {self._smali_label(target)}"
+                    )
+                lines.append("    .end sparse-switch")
+
+        code_size = len(self.instruction_units(code))
+        if code_size in labels:
+            lines.append(f"    {self._smali_label(code_size)}")
+        lines.append(".end method")
+        return lines
+
+    def smali_class(self, class_number: int) -> str:
+        class_def = self.class_def(class_number)
+        descriptor = self.type_descriptor(class_def.class_idx)
+        access, unknown_access = _access_words(class_def.access_flags, "class")
+        lines = ["# Generated from Android DEX 012 by dex012.py"]
+        if unknown_access:
+            lines.append(f"# unknown class access flags: 0x{unknown_access:x}")
+        lines.append(f".class {' '.join(access + [descriptor])}")
+        superclass = (
+            self.type_descriptor(class_def.superclass_idx)
+            if class_def.superclass_idx != NO_INDEX else "Ljava/lang/Object;"
+        )
+        lines.append(f".super {superclass}")
+
+        class_source_idx: int | None = None
+        for list_off in (class_def.direct_methods_off, class_def.virtual_methods_off):
+            for method in self.methods(list_off):
+                code = self.code(method.code_off)
+                if code is not None and code.source_file_idx != NO_INDEX:
+                    class_source_idx = code.source_file_idx
+                    break
+            if class_source_idx is not None:
+                break
+        if class_source_idx is not None:
+            lines.append(f".source {json.dumps(self.string(class_source_idx))}")
+        for type_idx in self.type_list(class_def.interfaces_off):
+            lines.append(f".implements {self.type_descriptor(type_idx)}")
+        if class_def.annotations_off:
+            lines.append(
+                f"# DEX012 annotations at file offset 0x{class_def.annotations_off:x}"
+            )
+
+        lines.append("")
+        for field_idx, access_flags, value in self.static_fields(
+            class_def.static_fields_off
+        ):
+            field = self.field_id(field_idx)
+            words, unknown = _access_words(access_flags, "field")
+            name = self.string(field.name_idx)
+            field_type = self.string(field.type_descriptor_idx)
+            if unknown:
+                lines.append(f"# unknown field access flags: 0x{unknown:x}")
+            declaration = " ".join(words + [f"{name}:{field_type}"])
+            initial_value = self._smali_static_value(field_type, value)
+            if initial_value is not None:
+                declaration += f" = {initial_value}"
+            lines.append(f".field {declaration}")
+        for field_idx, access_flags in self.instance_fields(
+            class_def.instance_fields_off
+        ):
+            field = self.field_id(field_idx)
+            words, unknown = _access_words(access_flags, "field")
+            if unknown:
+                lines.append(f"# unknown field access flags: 0x{unknown:x}")
+            lines.append(
+                ".field "
+                + " ".join(
+                    words
+                    + [
+                        f"{self.string(field.name_idx)}:"
+                        f"{self.string(field.type_descriptor_idx)}"
+                    ]
+                )
+            )
+
+        for list_off in (class_def.direct_methods_off, class_def.virtual_methods_off):
+            for method in self.methods(list_off):
+                lines.append("")
+                lines.extend(self._smali_method(method, class_source_idx))
+        return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _smali_path(descriptor: str) -> Path:
+        if not descriptor.startswith("L") or not descriptor.endswith(";"):
+            raise DexError(f"class descriptor cannot be a Smali path: {descriptor!r}")
+        parts = descriptor[1:-1].split("/")
+        if any(not part or part in (".", "..") or "\\" in part for part in parts):
+            raise DexError(f"unsafe class descriptor path: {descriptor!r}")
+        return Path(*parts[:-1], parts[-1] + ".smali")
+
+    def smali_files(
+        self, class_filter: str | None = None
+    ) -> Iterator[tuple[str, Path, str]]:
+        for class_number in range(self.header.class_defs_size):
+            descriptor = self.type_descriptor(self.class_def(class_number).class_idx)
+            if class_filter and class_filter not in descriptor:
+                continue
+            yield descriptor, self._smali_path(descriptor), self.smali_class(class_number)
+
+    def write_smali(
+        self,
+        output_dir: str | Path,
+        class_filter: str | None = None,
+        force: bool = False,
+    ) -> list[Path]:
+        output_dir = Path(output_dir)
+        rendered = list(self.smali_files(class_filter))
+        targets = [output_dir / relative for _descriptor, relative, _text in rendered]
+        if len(set(targets)) != len(targets):
+            raise DexError("multiple classes map to the same Smali output path")
+        conflicts = [path for path in targets if path.exists()]
+        if conflicts and not force:
+            raise FileExistsError(
+                f"refusing to overwrite {conflicts[0]}; pass --force to replace outputs"
+            )
+        for (_descriptor, _relative, text), path in zip(rendered, targets):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text, encoding="utf-8")
+        return targets
+
     def validate(self) -> dict[str, object]:
         opcode_counts: Counter[str] = Counter()
         instruction_count = 0
@@ -1059,6 +1530,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--validate", action="store_true",
                         help="walk all structures and instruction streams")
     parser.add_argument("--json", action="store_true", help="emit validation data as JSON")
+    parser.add_argument("--smali-out", metavar="DIR",
+                        help="write one Smali file per class under DIR")
+    parser.add_argument("--force", action="store_true",
+                        help="allow --smali-out to replace existing class files")
     return parser
 
 
@@ -1067,7 +1542,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         dex = Dex012.from_path(args.input)
         sections: list[str] = []
-        if args.header or not (args.classes or args.disassemble or args.validate):
+        if args.header or not (
+            args.classes or args.disassemble or args.validate or args.smali_out
+        ):
             sections.append(dex.dump_header())
             checksum_ok, signature_ok = dex.checksum_status()
             sections.append(
@@ -1079,6 +1556,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if args.validate:
             result = dex.validate()
             sections.append(json.dumps(result, indent=2 if args.json else None))
+        if args.smali_out:
+            written = dex.write_smali(
+                args.smali_out, class_filter=args.class_filter, force=args.force
+            )
+            sections.append(
+                f"wrote {len(written)} Smali files to {Path(args.smali_out).resolve()}"
+            )
         print("\n\n".join(sections))
         return 0
     except (DexError, OSError, zipfile.BadZipFile) as exc:
