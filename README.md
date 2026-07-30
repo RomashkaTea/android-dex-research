@@ -1,11 +1,14 @@
 # Early Android DEX research
 
-This repository contains working tools and reverse-engineering notes for two
+This repository contains working tools and reverse-engineering notes for three
 pre-release Dalvik executable formats:
 
 - `tools/dex007.py` parses, validates, disassembles, and exports Smali from
   Android build 20645's `dex\n007\0` files. See
   [`tools/DEX007.md`](tools/DEX007.md).
+- `tools/dex009.py` does the same for build `htc-29386.0.9.0.0` and its
+  transitional `dex\n009\0` format. See
+  [`tools/DEX009.md`](tools/DEX009.md).
 - `tools/dex012.py` parses, validates, disassembles, and exports Smali from
   the later Sooner build's `dex\n012\0` files.
 - `tools/smali012.py` assembles the supported Smali subset into DEX 012.
@@ -13,6 +16,10 @@ pre-release Dalvik executable formats:
 The DEX 007 implementation has been validated against all 51 DEX-bearing
 APK/JAR files in build 20645: 4,905 classes, 31,167 code items, and 960,047
 decoded instructions and payloads.
+
+The DEX 009 implementation has been validated against all 49 DEX-bearing
+APK/JAR files in `htc-29386.0.9.0.0`: 7,636 classes, 48,461 code items, and
+1,622,847 decoded instructions and payloads.
 
 ## Android DEX 012 format notes
 

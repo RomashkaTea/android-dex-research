@@ -121,6 +121,9 @@ for _physical in range(0xF2, 0xFC):
 
 
 class Dex007(Dex012):
+    opcode_map = PHYSICAL_TO_LOGICAL
+    format_name = "DEX 007"
+
     def __init__(self, data: bytes, source: str = "<memory>"):
         self.data = data
         self.source = source
@@ -308,17 +311,17 @@ class Dex007(Dex012):
                 continue
 
             physical = word & 0xFF
-            logical = PHYSICAL_TO_LOGICAL[physical]
+            logical = self.opcode_map[physical]
             if logical is None:
                 raise DexError(
-                    f"unknown/unused DEX 007 opcode 0x{physical:02x} "
+                    f"unknown/unused {self.format_name} opcode 0x{physical:02x} "
                     f"at code unit 0x{pc:x}"
                 )
             fmt = FORMATS[logical]
             width = abs(FORMAT_WIDTHS.get(fmt, 0))
             if width == 0:
                 raise DexError(
-                    f"unsupported DEX 007 opcode 0x{physical:02x} "
+                    f"unsupported {self.format_name} opcode 0x{physical:02x} "
                     f"at code unit 0x{pc:x}"
                 )
             if pc + width > len(units):
